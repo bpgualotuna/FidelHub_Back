@@ -1,16 +1,16 @@
 {
-  "name": "chatcontrol-back",
+  "name": "fidelhub-back",
   "version": "1.0.0",
-  "description": "Backend NestJS - Sistema de chat profesional con WhatsApp e IA",
+  "description": "FidelHub_Back - Backend Omnicanal y Host de Servidores MCP",
   "prisma": {
     "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"
   },
   "scripts": {
-    "build": "nest build",
-    "start": "nest start",
+    "build": "prisma generate && nest build",
+    "start": "node dist/main.js",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
-    "start:prod": "node dist/main",
+    "start:prod": "node dist/main.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio"

@@ -4,9 +4,6 @@ import { IoAdapter } from '@nestjs/platform-socket.io';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  // Sin esto, una excepción no controlada (o el proceso muriendo por OOM) no deja rastro en los
-  // logs — solo se ve que el servicio dejó de responder. Loguearlo antes de morir facilita
-  // diagnosticar la próxima vez.
   process.on('unhandledRejection', (reason) => {
     console.error('Unhandled promise rejection:', reason);
   });
@@ -22,7 +19,7 @@ async function bootstrap() {
   // WebSocket con Socket.IO (mismo servidor HTTP)
   app.useWebSocketAdapter(new IoAdapter(app));
 
-  // CORS para el frontend Next.js
+  // CORS para cualquier frontend local o desplegado
   app.enableCors({
     origin: true,
     credentials: true,
@@ -37,7 +34,8 @@ async function bootstrap() {
   );
 
   const port = process.env.PORT || 3001;
-  await app.listen(port);
+  await app.listen(port, '0.0.0.0');
+  console.log(`[FidelHub_Back] Servidor escuchando en http://0.0.0.0:${port}`);
 }
 
 bootstrap().catch(console.error);
