@@ -4,6 +4,8 @@ import { PrismaModule } from './prisma/prisma.module';
 import { CommonModule } from './common/common.module';
 import { AuthModule } from './auth/auth.module';
 import { WhatsAppModule } from './whatsapp/whatsapp.module';
+import { ChannelsModule } from './channels/channels.module';
+import { McpHubModule } from './mcp-hub/mcp-hub.module';
 import { ChatModule } from './chat/chat.module';
 import { AiModule } from './ai/ai.module';
 import { BroadcastModule } from './broadcast/broadcast.module';
@@ -27,6 +29,8 @@ import { TagsModule } from './tags/tags.module';
     PrismaModule,
     AuthModule,
     WhatsAppModule,
+    ChannelsModule,
+    McpHubModule,
     ChatModule,
     AiModule,
     BroadcastModule,

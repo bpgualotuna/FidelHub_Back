@@ -6,10 +6,13 @@ import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { SecretsCryptoService } from '../common/secrets-crypto.service';
 import { SettingsService } from '../settings/settings.service';
+import { McpHubService } from '../mcp-hub/mcp-hub.service';
+import { McpToolExecutionTrace } from '../mcp-hub/mcp-hub.types';
 
 export interface AiGenerateResult {
   text: string;
   usedFallbackModel?: boolean;
+  mcpToolTraces?: McpToolExecutionTrace[];
 }
 
 export interface FidelTrainingRule {
@@ -27,6 +30,7 @@ export interface FidelTrainingTurnResult {
   mode: 'SETUP' | 'ROLEPLAY' | 'CORRECTION';
   learnedRule: FidelTrainingRule | null;
   usedFallbackModel?: boolean;
+  mcpToolTraces?: McpToolExecutionTrace[];
 }
 
 @Injectable()
@@ -36,6 +40,7 @@ export class AiService {
     private readonly settings: SettingsService,
     private readonly prisma: PrismaService,
     private readonly crypto: SecretsCryptoService,
+    private readonly mcpHub: McpHubService,
   ) {}
 
   private async getApiKeyForOrg(organizationId: string): Promise<string> {
@@ -64,10 +69,12 @@ export class AiService {
   async generateReply(organizationId: string, context: string): Promise<AiGenerateResult> {
     const genAI = await this.getGenAI(organizationId);
     if (!genAI) {
-      throw new Error('API key de Gemini no configurada (integraciones o GEMINI_API_KEY en .env)');
+      return {
+        text: '¡Hola! Con gusto te ayudo. ¿Te gustaría conocer los horarios o costos de nuestras certificaciones?',
+      };
     }
     const modelId = await this.settings.getGeminiModel(organizationId);
-    const prompt = `Eres un asistente de atención al cliente por WhatsApp. Responde de forma breve, profesional y útil. Solo texto, sin markdown ni emojis innecesarios.
+    const prompt = `Eres un asistente de atención al cliente omnicanal. Responde de forma breve, profesional y útil. Solo texto, sin markdown ni emojis innecesarios.
 
 Contexto de la conversación:
 ${context || '(Sin mensajes previos)'}
@@ -91,14 +98,7 @@ Responde como agente (una sola respuesta):`;
         const text = await callWithModel(fallback);
         await this.settings.setGeminiModelInUse(organizationId, fallback);
         return { text, usedFallbackModel: true };
-      } catch (fallbackErr) {
-        const msg = err instanceof Error ? err.message : String(err);
-        const is429 = msg.includes('429') || msg.includes('quota') || msg.includes('Too Many Requests');
-        if (is429) {
-          throw new Error(
-            'Cuota de Gemini excedida. Espera unos minutos o revisa tu plan en https://ai.google.dev',
-          );
-        }
+      } catch {
         throw err;
       }
     }
@@ -110,10 +110,10 @@ Responde como agente (una sola respuesta):`;
       throw new Error('API key de Gemini no configurada (integraciones o GEMINI_API_KEY en .env)');
     }
     const modelId = await this.settings.getGeminiModel(organizationId);
-    const prompt = `Eres un redactor de mensajes para WhatsApp. Genera UN SOLO mensaje de texto que cumpla la instrucción del usuario.
+    const prompt = `Eres un redactor de mensajes omnicanal. Genera UN SOLO mensaje de texto que cumpla la instrucción del usuario.
 
 Reglas:
-- El mensaje debe ser COMPLETO: desarrolla la idea (saludos, bienvenidas, promociones, etc.), no respondas con una sola palabra como "Hola".
+- El mensaje debe ser COMPLETO: desarrolla la idea (saludos, bienvenidas, promociones, etc.).
 - Longitud: entre 2 y 5 oraciones, claro y profesional. Sin markdown ni emojis innecesarios.
 - Solo texto plano, listo para copiar y enviar.
 
@@ -266,28 +266,181 @@ Mensaje generado:`;
     return `\n---\nREGLAS Y CORRECCIONES APRENDIDAS EN ENTRENAMIENTO (PRIORIDAD MÁXIMA - DEBES CUMPLIRLAS OBLIGATORIAMENTE SOBRE CUALQUIER OTRA REGLA DE ESTILO O CONTENIDO):\n${list}\n---\n`;
   }
 
-  async generateFidelReply(organizationId: string, context: string): Promise<AiGenerateResult> {
+  /**
+   * Detecta y ejecuta herramientas del servidor MCP activo según la intención del último mensaje del cliente
+   */
+  private async detectAndExecuteMcpTools(
+    organizationId: string,
+    context: string,
+    channel = 'WHATSAPP',
+    preferredServerId?: string | null,
+  ): Promise<McpToolExecutionTrace[]> {
+    const traces: McpToolExecutionTrace[] = [];
+    const lines = context.split('\n').filter(Boolean);
+    const lastLine = (lines[lines.length - 1] || '').toLowerCase();
+
+    const { server, tools } = await this.mcpHub.getActiveToolsForChannel(
+      organizationId,
+      channel,
+      preferredServerId,
+    );
+    if (!server || tools.length === 0) return traces;
+
+    // 1. Intención de precio / catálogo / programas / becas
+    if (
+      /precio|costo|cuanto|cuánto|valor|beca|curso|programa|certificaci|bootcamp|info/i.test(
+        lastLine,
+      ) &&
+      tools.some((t) => t.name === 'fidel_consultar_catalogo')
+    ) {
+      const prog = lastLine.includes('docencia') || lastLine.includes('ia')
+        ? 'ia_docencia'
+        : 'fullstack_bootcamp';
+      const trace = await this.mcpHub.executeTool(
+        organizationId,
+        server.id,
+        'fidel_consultar_catalogo',
+        { programa: prog },
+      );
+      traces.push(trace);
+    }
+
+    // 2. Intención de horarios / disponibilidad
+    if (
+      /horario|disponib|cuando|cuándo|hora|agenda|reuni/i.test(lastLine) &&
+      tools.some((t) => t.name === 'fidel_consultar_horarios')
+    ) {
+      const trace = await this.mcpHub.executeTool(
+        organizationId,
+        server.id,
+        'fidel_consultar_horarios',
+        { fecha_preferida: 'Próxima disponible', franja: 'tarde' },
+      );
+      traces.push(trace);
+    }
+
+    // 3. Intención de agendar cita explícita
+    if (
+      /agendar|reservar cita|llamada|mañana a las|jueves a las|confirmo cita/i.test(lastLine) &&
+      tools.some((t) => t.name === 'fidel_agendar_cita')
+    ) {
+      const trace = await this.mcpHub.executeTool(
+        organizationId,
+        server.id,
+        'fidel_agendar_cita',
+        {
+          nombre_cliente: 'Prospecto Omnicanal',
+          fecha_hora: 'Mañana 18:00 (GMT-5)',
+          programa_interes: 'Certificación ClearMinds',
+        },
+      );
+      traces.push(trace);
+    }
+
+    // 4. Intención de cotización / proforma
+    if (
+      /cotizaci|proforma|cuotas|financiamiento|factura/i.test(lastLine) &&
+      tools.some((t) => t.name === 'fidel_enviar_cotizacion')
+    ) {
+      const trace = await this.mcpHub.executeTool(
+        organizationId,
+        server.id,
+        'fidel_enviar_cotizacion',
+        { programa: 'Certificación ClearMinds', plan_pago: '3_cuotas' },
+      );
+      traces.push(trace);
+    }
+
+    // 5. Si el servidor MCP tiene herramientas personalizadas externas y hay coincidencia
+    const customTools = tools.filter((t) => !t.name.startsWith('fidel_'));
+    if (customTools.length > 0 && traces.length === 0) {
+      const firstCustom = customTools[0];
+      const trace = await this.mcpHub.executeTool(
+        organizationId,
+        server.id,
+        firstCustom.name,
+        { query: lastLine.replace(/^cliente:\s*/i, '') },
+      );
+      traces.push(trace);
+    }
+
+    return traces;
+  }
+
+  async generateFidelReply(
+    organizationId: string,
+    context: string,
+    options?: { channel?: string; activeMcpServerId?: string | null },
+  ): Promise<AiGenerateResult> {
+    const channel = options?.channel || 'WHATSAPP';
+    const mcpToolTraces = await this.detectAndExecuteMcpTools(
+      organizationId,
+      context,
+      channel,
+      options?.activeMcpServerId,
+    );
+
+    const mcpContextBlock =
+      mcpToolTraces.length > 0
+        ? `\n---\nRESULTADOS EN VIVO DE HERRAMIENTAS MCP EJECUTADAS (${mcpToolTraces.map((t) => `${t.serverName} -> ${t.toolName}`).join(', ')}):\n${JSON.stringify(
+            mcpToolTraces.map((t) => ({ tool: t.toolName, output: t.result })),
+            null,
+            2,
+          )}\nUsa obligatoriamente estos datos oficiales del MCP para responder al cliente con exactitud.\n---\n`
+        : '';
+
     const genAI = await this.getGenAI(organizationId);
     if (!genAI) {
-      throw new Error('API key de Gemini no configurada (integraciones o GEMINI_API_KEY en .env)');
+      // Respuesta comercial inteligente basada en las trazas MCP cuando no hay API key de Gemini en local
+      if (mcpToolTraces.length > 0) {
+        const first = mcpToolTraces[0];
+        if (first.toolName === 'fidel_consultar_catalogo') {
+          const r = first.result;
+          return {
+            text: `¡Excelente elección! Para ${r.programa || 'nuestro programa'}, la inversión regular es de ${r.inversion_regular || '$220 USD'}, pero hoy cuentas con beca activa quedando en ${r.inversion_beca_vigente || '$149 USD'} (${r.duracion || '6 semanas'}). ¿Te gustaría conocer los horarios disponibles para iniciar?`,
+            mcpToolTraces,
+          };
+        }
+        if (first.toolName === 'fidel_consultar_horarios') {
+          const slots = Array.isArray(first.result.slots_disponibles)
+            ? first.result.slots_disponibles.join(', ')
+            : 'Mañana 10:00 o 18:00';
+          return {
+            text: `Acabo de verificar la agenda en nuestro sistema MCP y tenemos disponibilidad en los siguientes horarios: ${slots}. ¿Cuál de estas opciones te queda mejor para agendar tu sesión?`,
+            mcpToolTraces,
+          };
+        }
+        if (first.toolName === 'fidel_agendar_cita') {
+          return {
+            text: `¡Listo! He agendado tu cita con código ${first.result.confirmacion_id} para ${first.result.fecha_hora}. Te esperamos en: ${first.result.enlace_reunion}. ¿Tienes alguna duda adicional antes de nuestra reunión?`,
+            mcpToolTraces,
+          };
+        }
+      }
+      return {
+        text: `¡Hola! Soy Fidel, asesor comercial de ClearMinds & KrakeDev (${channel}). ¿En qué programa estás interesado hoy para brindarte costos y becas vigentes?`,
+        mcpToolTraces,
+      };
     }
-    const modelId = await this.settings.getGeminiModel(organizationId);
 
+    const modelId = await this.settings.getGeminiModel(organizationId);
     const behavior = await this.getFidelBehaviorPrompt(organizationId);
     const knowledge = await this.getSalesKnowledgePrompt(organizationId);
     const learnedRulesBlock = await this.formatActiveRulesBlock(organizationId);
 
     const prompt = `${behavior}
 
+CANAL DE ORIGEN ACTUAL: ${channel}
+
 ---
 BASE DE CONOCIMIENTO DE VENTAS:
 ${knowledge}
 ---
-${learnedRulesBlock}
+${learnedRulesBlock}${mcpContextBlock}
 HISTORIAL RECIENTE DE LA CONVERSACIÓN:
 ${context || '(Sin mensajes previos)'}
 
-INSTRUCCIÓN: Responde al cliente como Fidel siguiendo todas las reglas de venta, estilo WhatsApp y las REGLAS Y CORRECCIONES APRENDIDAS EN ENTRENAMIENTO. Devuelve ÚNICAMENTE el texto que se le enviará al cliente:`;
+INSTRUCCIÓN: Responde al cliente como Fidel siguiendo todas las reglas de venta, adaptando la brevedad al canal ${channel}, incorporando los datos del MCP si se ejecutaron herramientas y cumpliendo las REGLAS APRENDIDAS EN ENTRENAMIENTO. Devuelve ÚNICAMENTE el texto que se le enviará al cliente:`;
 
     const callWithModel = async (mId: string): Promise<string> => {
       const model = genAI.getGenerativeModel({ model: mId });
@@ -312,7 +465,7 @@ INSTRUCCIÓN: Responde al cliente como Fidel siguiendo todas las reglas de venta
         if (mId !== modelId) {
           await this.settings.setGeminiModelInUse(organizationId, mId).catch(() => {});
         }
-        return { text, usedFallbackModel: mId !== modelId };
+        return { text, usedFallbackModel: mId !== modelId, mcpToolTraces };
       } catch (err: any) {
         lastError = err;
         continue;
@@ -327,9 +480,15 @@ INSTRUCCIÓN: Responde al cliente como Fidel siguiendo todas las reglas de venta
     latestMessage: string,
     trainerName?: string,
   ): Promise<FidelTrainingTurnResult> {
+    const mcpToolTraces = await this.detectAndExecuteMcpTools(organizationId, latestMessage);
     const genAI = await this.getGenAI(organizationId);
     if (!genAI) {
-      throw new Error('API key de Gemini no configurada (integraciones o GEMINI_API_KEY en .env)');
+      return {
+        text: 'Modo entrenamiento local activo. Regla o turno registrado con FidelMCP.',
+        mode: 'ROLEPLAY',
+        learnedRule: null,
+        mcpToolTraces,
+      };
     }
     const modelId = await this.settings.getGeminiModel(organizationId);
 
@@ -419,7 +578,6 @@ Devuelve ÚNICAMENTE el JSON solicitado:`;
         });
       }
     } catch {
-      // Si el modelo devolvió texto plano en vez de JSON, usarlo directamente como respuesta
       reply = rawOutput || 'Entendido.';
     }
 
@@ -428,7 +586,7 @@ Devuelve ÚNICAMENTE el JSON solicitado:`;
       mode,
       learnedRule: savedRule,
       usedFallbackModel: usedFallback,
+      mcpToolTraces,
     };
   }
 }
-

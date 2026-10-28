@@ -11,6 +11,7 @@ import { WhatsAppModule } from '../whatsapp/whatsapp.module';
 import { AiModule } from '../ai/ai.module';
 import { SettingsModule } from '../settings/settings.module';
 import { LeadAssignmentModule } from '../lead-assignment/lead-assignment.module';
+import { ChannelsModule } from '../channels/channels.module';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { LeadAssignmentModule } from '../lead-assignment/lead-assignment.module'
       inject: [ConfigService],
     }),
     forwardRef(() => WhatsAppModule),
+    forwardRef(() => ChannelsModule),
     AiModule,
     SettingsModule,
     forwardRef(() => LeadAssignmentModule),

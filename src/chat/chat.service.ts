@@ -1,8 +1,20 @@
-import { Injectable, BadRequestException, ForbiddenException, NotFoundException, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
+  Logger,
+  OnModuleInit,
+  OnModuleDestroy,
+  Inject,
+  forwardRef,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { MessageDirection, MessageStatus, MessageType } from '@prisma/client';
+import { ChannelType, MessageDirection, MessageStatus, MessageType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { WhatsAppService } from '../whatsapp/whatsapp.service';
+import { ChannelsService } from '../channels/channels.service';
+import type { SupportedChannel } from '../channels/channels.types';
 import { Window24hService } from '../common/window-24h.service';
 import { AiService } from '../ai/ai.service';
 import { SettingsService } from '../settings/settings.service';
@@ -10,12 +22,18 @@ import { ChatGateway } from './chat.gateway';
 import { LeadAssignmentService } from '../lead-assignment/lead-assignment.service';
 import { StorageService } from '../common/storage.service';
 import { normalizePhone } from '../common/phone.util';
-import { ensureWhatsAppCompatibleVideo, withMp4Extension, WHATSAPP_VIDEO_MAX_BYTES } from '../common/video-transcode.util';
+import {
+  ensureWhatsAppCompatibleVideo,
+  withMp4Extension,
+  WHATSAPP_VIDEO_MAX_BYTES,
+} from '../common/video-transcode.util';
 import { ConversationsQueryService } from './conversations-query.service';
+import type { McpToolExecutionTrace } from '../mcp-hub/mcp-hub.types';
 
 export interface Message {
   id: string;
   conversationId: string;
+  channel?: SupportedChannel;
   fromUser: boolean;
   text: string;
   timestamp: number;
@@ -25,6 +43,8 @@ export interface Message {
   mimeType?: string | null;
   fileName?: string | null;
   status?: string;
+  metadata?: Record<string, any> | null;
+  mcpToolTraces?: McpToolExecutionTrace[] | null;
   referral?: {
     source_url?: string;
     source_id?: string;
@@ -45,7 +65,6 @@ export interface Message {
     type?: string;
     mediaUrl?: string | null;
   } | null;
-  /** true si el mensaje es una respuesta/cita a otro, aunque no podamos resolver su contenido (ej. citó un mensaje que no pasó por nuestro sistema). */
   isReply?: boolean;
 }
 
@@ -57,6 +76,9 @@ export interface Conversation {
   tag?: string | null;
   tagId?: string | null;
   contactId?: string;
+  channel?: SupportedChannel;
+  externalHandle?: string;
+  activeMcpServerId?: string | null;
   isSandboxAuthorized?: boolean;
   lastUserMessageAt: number | null;
   lastMessagePreview: string;
@@ -75,6 +97,8 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly prisma: PrismaService,
     private readonly whatsapp: WhatsAppService,
+    @Inject(forwardRef(() => ChannelsService))
+    private readonly channels: ChannelsService,
     private readonly window24h: Window24hService,
     private readonly ai: AiService,
     private readonly settings: SettingsService,
@@ -88,6 +112,8 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
   async registerIncomingMessage(payload: {
     organizationId: string;
     from: string;
+    externalUsername?: string;
+    channel?: SupportedChannel;
     messageId: string;
     timestamp: number;
     text: string;
@@ -99,10 +125,17 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     replyToWamid?: string;
     quickReply?: boolean;
     referral?: Record<string, any>;
+    metadata?: Record<string, any>;
   }): Promise<void> {
-    const phone = normalizePhone(payload.from);
+    const channel: SupportedChannel = (payload.channel?.toUpperCase() as SupportedChannel) || 'WHATSAPP';
+    const rawFrom = payload.from.trim();
+    const identifier =
+      channel === 'WHATSAPP'
+        ? normalizePhone(rawFrom)
+        : rawFrom.startsWith(`${channel.toLowerCase()}:`)
+          ? rawFrom
+          : `${channel.toLowerCase()}:${rawFrom}`;
 
-    // Obtener campaña activa (intentando coincidir por titular si el lead viene de un anuncio)
     let matchedCampaign: any = null;
     if (payload.referral?.headline && typeof payload.referral.headline === 'string') {
       matchedCampaign = await this.prisma.campaign.findFirst({
@@ -114,31 +147,64 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
-    const activeCampaign = matchedCampaign || (await this.prisma.campaign.findFirst({
-      where: { organizationId: payload.organizationId, isActive: true },
-    }));
+    const activeCampaign =
+      matchedCampaign ||
+      (await this.prisma.campaign.findFirst({
+        where: { organizationId: payload.organizationId, isActive: true },
+      }));
     const activeCampaignId = activeCampaign?.id ?? null;
 
     const contactUpdateData: any = {};
     if (activeCampaignId) {
       contactUpdateData.campaignId = activeCampaignId;
     }
+    if (payload.externalUsername) {
+      contactUpdateData.externalHandle = payload.externalUsername;
+    }
 
     const contact = await this.prisma.contact.upsert({
       where: {
         organizationId_phone: {
           organizationId: payload.organizationId,
-          phone,
+          phone: identifier,
         },
       },
-      create: { 
-        organizationId: payload.organizationId, 
-        phone,
-        name: payload.contactName || null,
+      create: {
+        organizationId: payload.organizationId,
+        phone: identifier,
+        name: payload.contactName || payload.externalUsername || null,
         campaignId: activeCampaignId,
+        channel: channel as ChannelType,
+        externalHandle: payload.externalUsername || null,
+        isSandboxAuthorized: true,
       },
       update: contactUpdateData,
     });
+
+    // Registrar también en ContactChannelIdentity si la tabla existe
+    try {
+      await this.prisma.contactChannelIdentity.upsert({
+        where: {
+          organizationId_channel_externalId: {
+            organizationId: payload.organizationId,
+            channel: channel as ChannelType,
+            externalId: rawFrom,
+          },
+        },
+        create: {
+          organizationId: payload.organizationId,
+          contactId: contact.id,
+          channel: channel as ChannelType,
+          externalId: rawFrom,
+          usernameHandle: payload.externalUsername || null,
+        },
+        update: {
+          usernameHandle: payload.externalUsername || undefined,
+        },
+      });
+    } catch {
+      /* ignore if migration pending */
+    }
 
     let conversation = await this.prisma.conversation.findFirst({
       where: { contactId: contact.id },
@@ -150,13 +216,18 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       conversation = await this.prisma.conversation.create({
         data: {
           contactId: contact.id,
+          channel: channel as ChannelType,
           lastUserMessageAt: new Date(payload.timestamp),
           campaignId: activeCampaignId,
+          isAiActive: true, // Activar Fidel automáticamente para nuevos leads omnicanal
           adReferral: payload.referral ? (payload.referral as any) : undefined,
         },
       });
     } else {
-      const updateData: any = { lastUserMessageAt: new Date(payload.timestamp) };
+      const updateData: any = {
+        lastUserMessageAt: new Date(payload.timestamp),
+        channel: channel as ChannelType,
+      };
       if (activeCampaignId && conversation.campaignId !== activeCampaignId) {
         updateData.campaignId = activeCampaignId;
       }
@@ -169,7 +240,6 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
-    // Historial en CampaignContact
     if (activeCampaign) {
       await this.prisma.campaignContact.upsert({
         where: {
@@ -186,7 +256,6 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
-    // Detectar edición: buscar mensaje existente por wamid
     const existingMessage = await this.prisma.message.findUnique({
       where: { whatsappMessageId: payload.messageId },
     });
@@ -225,9 +294,6 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
         const quoted = await this.prisma.message.findUnique({
           where: { whatsappMessageId: payload.replyToWamid },
         });
-        this.logger.log(
-          `registerIncomingMessage: replyToWamid=${payload.replyToWamid} quotedFound=${!!quoted}`,
-        );
         if (quoted) {
           replyToId = quoted.id;
           replyToSnapshot = {
@@ -240,8 +306,6 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
         }
       }
 
-      // TODO: hacer configurables por plantilla las respuestas, estados y acciones.
-      // Por ahora solo esta plantilla cambia el interés y la asignación.
       let interestStatus: 'INTERESTED' | 'NOT_INTERESTED' | null = null;
       if (payload.quickReply && replyToId) {
         const original = await this.prisma.message.findUnique({
@@ -249,8 +313,15 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
           select: { metaTemplateName: true, direction: true },
         });
         const templateKey = original?.metaTemplateName?.toLowerCase().replace(/[^a-z0-9]/g, '');
-        if (original?.direction === MessageDirection.OUT && templateKey === 'diplomadoiaparadocentes') {
-          const answer = payload.text.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        if (
+          original?.direction === MessageDirection.OUT &&
+          templateKey === 'diplomadoiaparadocentes'
+        ) {
+          const answer = payload.text
+            .trim()
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '');
           if (answer === 'quiero mas informacion') interestStatus = 'INTERESTED';
           if (answer === 'no deseo recibir mas informacion') interestStatus = 'NOT_INTERESTED';
         }
@@ -259,6 +330,7 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       const created = await this.prisma.message.create({
         data: {
           conversationId: conversation.id,
+          channel: channel as ChannelType,
           direction: MessageDirection.IN,
           type: payload.type || MessageType.TEXT,
           status: MessageStatus.RECEIVED,
@@ -271,6 +343,7 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
           replyToId,
           replyToWamid: payload.replyToWamid,
           referral: payload.referral ? (payload.referral as any) : undefined,
+          metadata: payload.metadata ? (payload.metadata as any) : undefined,
         },
       });
       this.processedIncomingMsgIds.add(created.id);
@@ -302,6 +375,7 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
         {
           id: created.id,
           conversationId: conversation.id,
+          channel,
           fromUser: true,
           text: payload.text,
           timestamp: payload.timestamp,
@@ -312,16 +386,18 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
           replyTo: replyToSnapshot,
           isReply: !!payload.replyToWamid,
           referral: created.referral,
+          metadata: payload.metadata,
         } as any,
       );
 
-      // Respuesta automática de Fidel si la IA está activa
       this.triggerFidelAutoReply(payload.organizationId, conversation.id, contact.phone);
     }
   }
 
-
-  private async assertConversationInOrg(conversationId: string, organizationId: string): Promise<void> {
+  private async assertConversationInOrg(
+    conversationId: string,
+    organizationId: string,
+  ): Promise<void> {
     const c = await this.prisma.conversation.findFirst({
       where: { id: conversationId, contact: { organizationId } },
       select: { id: true },
@@ -333,11 +409,17 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     organizationId: string,
     userId?: string,
     userRole?: string,
+    channel?: string,
   ): Promise<Conversation[]> {
-    return this.conversationsQuery.getConversations(organizationId, userId, userRole);
+    return this.conversationsQuery.getConversations(organizationId, userId, userRole, channel);
   }
 
-  async searchConversationsByMessage(organizationId: string, query: string, userId?: string, userRole?: string) {
+  async searchConversationsByMessage(
+    organizationId: string,
+    query: string,
+    userId?: string,
+    userRole?: string,
+  ) {
     return this.conversationsQuery.searchByMessage(organizationId, query, userId, userRole);
   }
 
@@ -374,14 +456,14 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
   }
 
   async getMessages(
-    conversationId: string, 
-    organizationId: string, 
+    conversationId: string,
+    organizationId: string,
     cursor?: string,
     userId?: string,
     userRole?: string,
   ): Promise<{ messages: Message[]; nextCursor: string | null }> {
     await this.assertConversationAccess(conversationId, organizationId, userId, userRole);
-    
+
     const take = 50;
     const rows = await this.prisma.message.findMany({
       where: { conversationId },
@@ -400,6 +482,7 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     const messages = rows.reverse().map((m) => ({
       id: m.id,
       conversationId: m.conversationId,
+      channel: ((m as any).channel || 'WHATSAPP') as SupportedChannel,
       fromUser: m.direction === MessageDirection.IN,
       text: m.body,
       timestamp: m.whatsappTimestamp.getTime(),
@@ -410,6 +493,10 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       fileName: m.fileName,
       status: m.status,
       referral: (m as any).referral ?? undefined,
+      metadata: (m as any).metadata ?? undefined,
+      mcpToolTraces: Array.isArray((m as any).mcpToolTraces)
+        ? ((m as any).mcpToolTraces as McpToolExecutionTrace[])
+        : undefined,
       replyTo: m.replyTo
         ? {
             id: m.replyTo.id,
@@ -438,10 +525,14 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       where: {
         conversationId,
         OR: [
-          { type: { in: [MessageType.IMAGE, MessageType.VIDEO, MessageType.AUDIO, MessageType.DOCUMENT] } },
+          {
+            type: {
+              in: [MessageType.IMAGE, MessageType.VIDEO, MessageType.AUDIO, MessageType.DOCUMENT],
+            },
+          },
           { body: { contains: 'http://', mode: 'insensitive' } },
-          { body: { contains: 'https://', mode: 'insensitive' } }
-        ]
+          { body: { contains: 'https://', mode: 'insensitive' } },
+        ],
       },
       take: take + 1,
       cursor: cursor ? { id: cursor } : undefined,
@@ -470,15 +561,21 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  async searchMessages(conversationId: string, organizationId: string, query: string, userId?: string, userRole?: string): Promise<Message[]> {
+  async searchMessages(
+    conversationId: string,
+    organizationId: string,
+    query: string,
+    userId?: string,
+    userRole?: string,
+  ): Promise<Message[]> {
     await this.assertConversationAccess(conversationId, organizationId, userId, userRole);
     if (!query || query.trim().length === 0) return [];
-    
+
     const rows = await this.prisma.message.findMany({
-      where: { 
+      where: {
         conversationId,
         body: { contains: query, mode: 'insensitive' },
-        type: MessageType.TEXT
+        type: MessageType.TEXT,
       },
       orderBy: { whatsappTimestamp: 'desc' },
     });
@@ -504,8 +601,14 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
 
   async canSendToConversation(conversationId: string, organizationId: string): Promise<boolean> {
     await this.assertConversationInOrg(conversationId, organizationId);
-    const lastAt = await this.getConversationLastUserMessageAt(conversationId);
-    return this.window24h.canSendFreeMessage(lastAt);
+    const conv = await this.prisma.conversation.findUnique({
+      where: { id: conversationId },
+      select: { lastUserMessageAt: true, channel: true },
+    });
+    if (conv && (conv as any).channel && (conv as any).channel !== 'WHATSAPP') {
+      return true;
+    }
+    return this.window24h.canSendFreeMessage(conv?.lastUserMessageAt ?? null);
   }
 
   async getWindowSecondsRemaining(conversationId: string, organizationId: string): Promise<number> {
@@ -528,11 +631,14 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       include: { contact: true },
     });
     if (!conv) throw new BadRequestException('Conversación no encontrada');
-    const isSandbox = this.config.get<string>('WHATSAPP_SANDBOX', 'true') === 'true';
-    if (isSandbox && !conv.contact.isSandboxAuthorized) {
-      throw new ForbiddenException(
-        'Este número no está autorizado en Meta (sandbox). Agrégalo en Contactos y márcalo como autorizado.',
-      );
+    const convChannel = ((conv as any).channel || 'WHATSAPP') as SupportedChannel;
+    if (convChannel === 'WHATSAPP') {
+      const isSandbox = this.config.get<string>('WHATSAPP_SANDBOX', 'true') === 'true';
+      if (isSandbox && !conv.contact.isSandboxAuthorized) {
+        throw new ForbiddenException(
+          'Este número no está autorizado en Meta (sandbox). Agrégalo en Contactos y márcalo como autorizado.',
+        );
+      }
     }
     await this.settings.checkDailyLimitOrThrow(conversationId, organizationId);
     return conv;
@@ -587,7 +693,11 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     sentByUserId?: string | null;
     replyToId?: string;
   }): Promise<Message> {
-    const conv = await this.assertCanSendAndGetConversation(params.organizationId, params.conversationId);
+    const conv = await this.assertCanSendAndGetConversation(
+      params.organizationId,
+      params.conversationId,
+    );
+    const channel = (((conv as any).channel || 'WHATSAPP') as SupportedChannel);
     const lastUserMessageAt = conv.lastUserMessageAt ? new Date(conv.lastUserMessageAt) : null;
 
     let replyToSnapshot: Message['replyTo'];
@@ -608,21 +718,39 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    const { messageId } = await this.whatsapp.sendTextMessage(params.organizationId, {
-      to: conv.contact.phone,
-      text: params.text,
-      lastUserMessageAt,
-      replyToWamid,
-    });
+    let externalId = `${channel.toLowerCase()}_out_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    if (channel === 'WHATSAPP') {
+      try {
+        const res = await this.whatsapp.sendTextMessage(params.organizationId, {
+          to: conv.contact.phone,
+          text: params.text,
+          lastUserMessageAt,
+          replyToWamid,
+        });
+        if (res?.messageId) externalId = res.messageId;
+      } catch (err: any) {
+        this.logger.warn(`WhatsApp Cloud API no disponible (${err?.message}), guardando mensaje local`);
+      }
+    } else {
+      const recipientId = conv.contact.phone.replace(/^(instagram|facebook|tiktok):/i, '');
+      const sent = await this.channels.sendOutgoingByChannel(channel, {
+        organizationId: params.organizationId,
+        recipientId,
+        text: params.text,
+      });
+      externalId = sent.externalMessageId;
+    }
+
     const now = new Date();
     const created = await this.prisma.message.create({
       data: {
         conversationId: params.conversationId,
+        channel: channel as ChannelType,
         direction: MessageDirection.OUT,
         type: MessageType.TEXT,
         status: MessageStatus.SENT,
         body: params.text,
-        whatsappMessageId: messageId,
+        whatsappMessageId: externalId,
         whatsappTimestamp: now,
         fromAi: params.fromAi ?? false,
         sentByUserId: params.sentByUserId ?? null,
@@ -645,6 +773,7 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     const msg: Message = {
       id: created.id,
       conversationId: created.conversationId,
+      channel,
       fromUser: false,
       text: created.body,
       timestamp: created.whatsappTimestamp.getTime(),
@@ -654,7 +783,11 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       isReply: !!replyToSnapshot,
     };
     this.chatGateway.emitNewMessage(params.organizationId, params.conversationId, msg);
-    await this.ensureCampaignAssignment(params.organizationId, conv.contact.id, params.conversationId);
+    await this.ensureCampaignAssignment(
+      params.organizationId,
+      conv.contact.id,
+      params.conversationId,
+    );
     return msg;
   }
 
@@ -666,13 +799,18 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     fileName?: string;
     sentByUserId?: string | null;
   }): Promise<Message> {
-    const conv = await this.assertCanSendAndGetConversation(params.organizationId, params.conversationId);
-    const lastUserMessageAt = conv.lastUserMessageAt ? new Date(conv.lastUserMessageAt) : null;
+    const conv = await this.assertCanSendAndGetConversation(
+      params.organizationId,
+      params.conversationId,
+    );
 
-    const msgType = params.mimeType.startsWith('image/') ? MessageType.IMAGE
-      : params.mimeType.startsWith('video/') ? MessageType.VIDEO
-      : params.mimeType.startsWith('audio/') ? MessageType.AUDIO
-      : MessageType.DOCUMENT;
+    const msgType = params.mimeType.startsWith('image/')
+      ? MessageType.IMAGE
+      : params.mimeType.startsWith('video/')
+        ? MessageType.VIDEO
+        : params.mimeType.startsWith('audio/')
+          ? MessageType.AUDIO
+          : MessageType.DOCUMENT;
 
     const { messageId } = await this.whatsapp.sendMediaRaw(
       params.organizationId,
@@ -712,7 +850,11 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       status: created.status,
     };
     this.chatGateway.emitNewMessage(params.organizationId, params.conversationId, msg);
-    await this.ensureCampaignAssignment(params.organizationId, conv.contact.id, params.conversationId);
+    await this.ensureCampaignAssignment(
+      params.organizationId,
+      conv.contact.id,
+      params.conversationId,
+    );
     return msg;
   }
 
@@ -723,7 +865,10 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     type: MessageType;
     sentByUserId?: string | null;
   }): Promise<Message> {
-    const conv = await this.assertCanSendAndGetConversation(params.organizationId, params.conversationId);
+    const conv = await this.assertCanSendAndGetConversation(
+      params.organizationId,
+      params.conversationId,
+    );
 
     const { buffer, mimetype, transcoded } = await ensureWhatsAppCompatibleVideo(
       params.file.buffer,
@@ -732,10 +877,12 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     if (mimetype.startsWith('video/') && buffer.length > WHATSAPP_VIDEO_MAX_BYTES) {
       throw new BadRequestException(
         `El video pesa ${(buffer.length / 1024 / 1024).toFixed(1)}MB incluso tras comprimirlo; ` +
-          'WhatsApp no permite enviar videos de más de 16MB. Probá con un archivo más corto o de menor resolución.',
+          'WhatsApp no permite enviar videos de más de 16MB.',
       );
     }
-    const fileName = transcoded ? withMp4Extension(params.file.originalname) : params.file.originalname;
+    const fileName = transcoded
+      ? withMp4Extension(params.file.originalname)
+      : params.file.originalname;
 
     const timestamp = Date.now();
     const path = `chats/${params.organizationId}/sent_${timestamp}_${fileName}`;
@@ -786,31 +933,48 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     };
 
     this.chatGateway.emitNewMessage(params.organizationId, params.conversationId, msg);
-    await this.ensureCampaignAssignment(params.organizationId, conv.contact.id, params.conversationId);
+    await this.ensureCampaignAssignment(
+      params.organizationId,
+      conv.contact.id,
+      params.conversationId,
+    );
     return msg;
   }
 
   async generateAiReply(
     organizationId: string,
     conversationId: string,
-  ): Promise<{ text: string; usedFallbackModel?: boolean }> {
+  ): Promise<{ text: string; usedFallbackModel?: boolean; mcpToolTraces?: McpToolExecutionTrace[] }> {
     await this.assertConversationInOrg(conversationId, organizationId);
-    
+
+    const conv = await this.prisma.conversation.findUnique({
+      where: { id: conversationId },
+      select: { channel: true, activeMcpServerId: true },
+    });
+
     const rows = await this.prisma.message.findMany({
       where: { conversationId },
       orderBy: { whatsappTimestamp: 'desc' },
       take: 10,
     });
-    
+
     const recent = rows
       .reverse()
-      .map((m) => (m.direction === MessageDirection.IN ? `Cliente: ${m.body}` : `Agente: ${m.body}`));
-      
+      .map((m) => (m.direction === MessageDirection.IN ? `Cliente: ${m.body}` : `Fidel: ${m.body}`));
+
     const context = recent.join('\n');
-    return this.ai.generateReply(organizationId, context);
+    return this.ai.generateFidelReply(organizationId, context, {
+      channel: (conv as any)?.channel || 'WHATSAPP',
+      activeMcpServerId: (conv as any)?.activeMcpServerId,
+    });
   }
 
-  emitMessageStatusUpdate(organizationId: string, conversationId: string, messageId: string, status: string): void {
+  emitMessageStatusUpdate(
+    organizationId: string,
+    conversationId: string,
+    messageId: string,
+    status: string,
+  ): void {
     this.chatGateway.emitMessageStatusUpdate(organizationId, conversationId, messageId, status);
   }
 
@@ -860,6 +1024,19 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
+  async setConversationMcpServer(
+    conversationId: string,
+    organizationId: string,
+    mcpServerId: string | null,
+  ) {
+    await this.assertConversationInOrg(conversationId, organizationId);
+    await this.prisma.conversation.update({
+      where: { id: conversationId },
+      data: { activeMcpServerId: mcpServerId },
+    });
+    return { conversationId, activeMcpServerId: mcpServerId };
+  }
+
   private async assertConversationAccess(
     conversationId: string,
     organizationId: string,
@@ -907,10 +1084,7 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       const recentCutoff = new Date(Date.now() - 30_000);
       const convs = await this.prisma.conversation.findMany({
         where: {
-          OR: [
-            { isAiActive: true },
-            { lastUserMessageAt: { gte: recentCutoff } },
-          ],
+          OR: [{ isAiActive: true }, { lastUserMessageAt: { gte: recentCutoff } }],
         },
         include: {
           contact: true,
@@ -933,6 +1107,7 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
         this.chatGateway.emitNewMessage(conv.contact.organizationId, conv.id, {
           id: lastMsg.id,
           conversationId: conv.id,
+          channel: ((conv as any).channel || 'WHATSAPP') as SupportedChannel,
           fromUser: true,
           text: lastMsg.body,
           timestamp: lastMsg.whatsappTimestamp.getTime(),
@@ -944,12 +1119,11 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
         } as any);
 
         if (conv.isAiActive === true) {
-          this.logger.log(`Mensaje remoto detectado en conv=${conv.id} con Fidel activo. Disparando respuesta...`);
           this.triggerFidelAutoReply(conv.contact.organizationId, conv.id, conv.contact.phone);
         }
       }
-    } catch (err) {
-      // Silenciar errores transitorios de red en polling
+    } catch {
+      /* ignore transient errors */
     } finally {
       this.isPollingRemote = false;
     }
@@ -963,7 +1137,12 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  triggerFidelAutoReply(organizationId: string, conversationId: string, contactPhone: string, delayMs = 3000): void {
+  triggerFidelAutoReply(
+    organizationId: string,
+    conversationId: string,
+    contactPhone: string,
+    delayMs = 1500,
+  ): void {
     this.cancelFidelAutoReply(conversationId);
 
     const timer = setTimeout(async () => {
@@ -978,15 +1157,20 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     this.fidelDebounceTimers.set(conversationId, timer);
   }
 
-  async executeFidelReply(organizationId: string, conversationId: string, contactPhone: string): Promise<Message | null> {
+  async executeFidelReply(
+    organizationId: string,
+    conversationId: string,
+    contactPhone: string,
+  ): Promise<Message | null> {
     const conv = await this.prisma.conversation.findUnique({
       where: { id: conversationId },
-      select: { isAiActive: true },
+      select: { isAiActive: true, channel: true, activeMcpServerId: true },
     });
     if (!conv || !conv.isAiActive) {
-      this.logger.log(`Fidel omitido: la conversación ${conversationId} tiene isAiActive=false`);
       return null;
     }
+
+    const channel = (((conv as any).channel || 'WHATSAPP') as SupportedChannel);
 
     const rows = await this.prisma.message.findMany({
       where: { conversationId },
@@ -1002,6 +1186,7 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
 
     const inTraining = await this.isConversationInTrainingMode(conversationId, organizationId);
     let replyText = '';
+    let mcpToolTraces: McpToolExecutionTrace[] = [];
 
     if (inTraining) {
       const lastIn = [...ordered].reverse().find((m) => m.direction === MessageDirection.IN);
@@ -1013,6 +1198,7 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
         'Entrenador',
       );
       replyText = trainingResult.text?.trim() || '';
+      mcpToolTraces = trainingResult.mcpToolTraces || [];
       if (trainingResult.learnedRule) {
         this.chatGateway.server?.to(`org:${organizationId}`)?.emit('fidel_rule_learned', {
           conversationId,
@@ -1020,51 +1206,67 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
         });
       }
     } else {
-      const result = await this.ai.generateFidelReply(organizationId, context);
+      const result = await this.ai.generateFidelReply(organizationId, context, {
+        channel,
+        activeMcpServerId: (conv as any).activeMcpServerId,
+      });
       replyText = result.text?.trim() || '';
+      mcpToolTraces = result.mcpToolTraces || [];
     }
 
     if (!replyText) return null;
 
-    let wamid = `fidel_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    let externalId = `fidel_${channel.toLowerCase()}_${Date.now()}_${Math.random().toString(36).substring(7)}`;
 
-    // Si WhatsApp está configurado en la organización, enviar saliente por Cloud API
     try {
-      const sent = await this.whatsapp.sendTextMessageRaw(organizationId, contactPhone, replyText);
-      if (sent?.messageId) wamid = sent.messageId;
+      const recipientId = contactPhone.replace(/^(instagram|facebook|tiktok):/i, '');
+      const sent = await this.channels.sendOutgoingByChannel(channel, {
+        organizationId,
+        recipientId,
+        text: replyText,
+      });
+      if (sent?.externalMessageId) externalId = sent.externalMessageId;
     } catch (err: any) {
-      this.logger.warn(`Envío WhatsApp omitido/fallido (${err?.message || err}), guardando localmente`);
+      this.logger.warn(`Envío saliente (${channel}) en modo local: ${err?.message || err}`);
     }
 
     const created = await this.prisma.message.create({
       data: {
         conversationId,
+        channel: channel as ChannelType,
         direction: MessageDirection.OUT,
         type: MessageType.TEXT,
         status: MessageStatus.SENT,
         body: replyText,
         fromAi: true,
-        whatsappMessageId: wamid,
+        whatsappMessageId: externalId,
         whatsappTimestamp: new Date(),
+        mcpToolTraces: mcpToolTraces.length > 0 ? (mcpToolTraces as any) : undefined,
       },
     });
 
     const msgPayload: any = {
       id: created.id,
       conversationId,
+      channel,
       fromUser: false,
       text: replyText,
       timestamp: created.whatsappTimestamp.getTime(),
       type: MessageType.TEXT,
       fromAi: true,
       status: MessageStatus.SENT,
+      mcpToolTraces: mcpToolTraces.length > 0 ? mcpToolTraces : undefined,
     };
 
     this.chatGateway.emitNewMessage(organizationId, conversationId, msgPayload);
     return created as any;
   }
 
-  async setConversationAiActive(conversationId: string, organizationId: string, isAiActive: boolean): Promise<boolean> {
+  async setConversationAiActive(
+    conversationId: string,
+    organizationId: string,
+    isAiActive: boolean,
+  ): Promise<boolean> {
     await this.assertConversationInOrg(conversationId, organizationId);
     if (!isAiActive) {
       this.cancelFidelAutoReply(conversationId);
@@ -1102,7 +1304,10 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async isConversationInTrainingMode(conversationId: string, organizationId: string): Promise<boolean> {
+  async isConversationInTrainingMode(
+    conversationId: string,
+    organizationId: string,
+  ): Promise<boolean> {
     const ids = await this.getTrainingConversationIds(organizationId);
     return ids.includes(conversationId);
   }
@@ -1141,11 +1346,13 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       isAiActive = c?.isAiActive ?? false;
     }
 
-    this.chatGateway.server?.to(`org:${organizationId}`)?.emit('conversation_training_status_updated', {
-      conversationId,
-      isTrainingMode,
-      isAiActive,
-    });
+    this.chatGateway.server
+      ?.to(`org:${organizationId}`)
+      ?.emit('conversation_training_status_updated', {
+        conversationId,
+        isTrainingMode,
+        isAiActive,
+      });
 
     return { isTrainingMode, isAiActive };
   }
@@ -1156,7 +1363,12 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
 
   async addFidelRule(
     organizationId: string,
-    params: { instruction: string; category?: string; sourceFeedback?: string; createdByName?: string },
+    params: {
+      instruction: string;
+      category?: string;
+      sourceFeedback?: string;
+      createdByName?: string;
+    },
   ) {
     const rule = await this.ai.addFidelTrainingRule(organizationId, params);
     this.chatGateway.server?.to(`org:${organizationId}`)?.emit('fidel_rule_learned', { rule });
@@ -1181,7 +1393,12 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
       .slice(-10)
       .map((m) => (m.role === 'trainer' ? `Cliente/Entrenador: ${m.text}` : `Fidel: ${m.text}`))
       .join('\n');
-    const res = await this.ai.processFidelTrainingTurn(organizationId, context, message, trainerName);
+    const res = await this.ai.processFidelTrainingTurn(
+      organizationId,
+      context,
+      message,
+      trainerName,
+    );
     if (res.learnedRule) {
       this.chatGateway.server?.to(`org:${organizationId}`)?.emit('fidel_rule_learned', {
         rule: res.learnedRule,
@@ -1190,4 +1407,3 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
     return res;
   }
 }
-

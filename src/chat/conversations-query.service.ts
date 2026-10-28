@@ -49,11 +49,15 @@ export class ConversationsQueryService {
     organizationId: string,
     userId?: string,
     userRole?: string,
+    channelFilter?: string,
   ): Promise<Conversation[]> {
     const where: any = { contact: { organizationId } };
 
     if (userRole === 'AGENT' && userId) {
       where.assignedToUserId = userId;
+    }
+    if (channelFilter && channelFilter !== 'ALL') {
+      where.channel = channelFilter.toUpperCase();
     }
 
     const list = await this.prisma.conversation.findMany({
@@ -79,6 +83,9 @@ export class ConversationsQueryService {
         tag: c.contact.tag?.name ?? undefined,
         tagId: c.contact.tagId ?? undefined,
         contactId: c.contact.id,
+        channel: ((c as any).channel || (c.contact as any).channel || 'WHATSAPP') as any,
+        externalHandle: (c.contact as any).externalHandle ?? undefined,
+        activeMcpServerId: (c as any).activeMcpServerId ?? null,
         isSandboxAuthorized: c.contact.isSandboxAuthorized,
         lastUserMessageAt: c.lastUserMessageAt?.getTime() ?? null,
         lastMessagePreview: this.buildPreview(lastMsg),
@@ -125,6 +132,9 @@ export class ConversationsQueryService {
       tag: c.contact.tag?.name ?? undefined,
       tagId: c.contact.tagId ?? undefined,
       contactId: c.contact.id,
+      channel: ((c as any).channel || (c.contact as any).channel || 'WHATSAPP') as any,
+      externalHandle: (c.contact as any).externalHandle ?? undefined,
+      activeMcpServerId: (c as any).activeMcpServerId ?? null,
       isSandboxAuthorized: c.contact.isSandboxAuthorized,
       lastUserMessageAt: c.lastUserMessageAt?.getTime() ?? null,
       lastMessagePreview: this.buildPreview(lastMsg),
