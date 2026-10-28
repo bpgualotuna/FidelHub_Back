@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: chatcontrol
+      POSTGRES_PASSWORD: chatcontrol
+      POSTGRES_DB: chatcontrol
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatcontrol"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - '3001:3001'
+    env_file:
+      - .env.docker
+    volumes:
+      - .:/usr/src/app:cached
+      - backend_node_modules:/usr/src/app/node_modules
+    command: pnpm run start:dev
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+
+volumes:
+  postgres_data:
+  backend_node_modules:

@@ -1,0 +1,445 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-1.1.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Organization {
+  id                    String                   @id @default(cuid())
+  name                  String
+  status                OrganizationStatus       @default(ACTIVE)
+  hasCrm                Boolean                  @default(false)
+  whatsappPhoneNumberId String?                  @unique
+  createdAt             DateTime                 @default(now())
+  updatedAt             DateTime                 @default(now()) @updatedAt
+  contacts              Contact[]
+  credentials           OrganizationCredentials?
+  orgSettings           OrganizationSetting[]
+  templates             Template[]
+  users                 User[]
+  crmIntegration        CrmIntegration?
+  broadcastLists        BroadcastList[]
+  crmContactLinks       CrmContactLink[]
+  campaigns             Campaign[]
+  templateHeaderMedia   TemplateHeaderMedia[]
+  tags                  Tag[]
+}
+
+/// Recuerda el último archivo de header (imagen/video) subido para cada plantilla de Meta,
+/// para no tener que volver a subirlo en cada envío masivo con esa misma plantilla.
+model TemplateHeaderMedia {
+  id             String       @id @default(cuid())
+  organizationId String
+  templateId     String
+  mediaUrl       String
+  mimeType       String
+  fileName       String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @default(now()) @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, templateId])
+  @@index([organizationId])
+}
+
+/// Credenciales sensibles cifradas (AES-256-GCM). Solo el backend descifra.
+model OrganizationCredentials {
+  organizationId               String       @id
+  whatsappAccessTokenEnc       String?
+  whatsappBusinessAccountIdEnc String?
+  geminiApiKeyEnc              String?
+  updatedAt                    DateTime     @default(now()) @updatedAt
+  organization                 Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+}
+
+/// Ajustes por empresa (modelo Gemini, tier, etc.)
+model OrganizationSetting {
+  id             String       @id @default(cuid())
+  organizationId String
+  key            String
+  value          String
+  updatedAt      DateTime     @default(now()) @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, key])
+  @@index([organizationId])
+}
+
+/// Integración con CRM externo por organización
+model CrmIntegration {
+  id                String   @id @default(cuid())
+  organizationId    String   @unique
+  codigoVinculacion String   @unique
+  apiKeyHash        String   @default("")
+  apiKeyEncrypted   String?
+  crmUrl            String?
+  crmName           String   @default("CRM")
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @default(now()) @updatedAt
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([codigoVinculacion])
+}
+
+/// Lista de contactos para broadcast (manual o desde CRM)
+model BroadcastList {
+  id              String               @id @default(cuid())
+  organizationId  String
+  name            String
+  source          String               @default("manual") // "manual" | "crm"
+  crmExportedAt   DateTime?
+  contactCount    Int                  @default(0)
+  createdBy       String?
+  assignedToUserId String?             // Usuario de ChatControl que recibe los contactos (CRM)
+  assignedToUser  User?                @relation("BroadcastListsAssigned", fields: [assignedToUserId], references: [id])
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @default(now()) @updatedAt
+  organization    Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  contacts        BroadcastListContact[]
+  crmContactLinks  CrmContactLink[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+  @@index([source])
+  @@index([assignedToUserId])
+}
+
+/// Contacto dentro de una lista de broadcast
+model BroadcastListContact {
+  id          String       @id @default(cuid())
+  listId      String
+  contactId   String
+  externalId  String?
+  campaign    String?
+  seller      String?
+  source      String?      @default("crm")
+  createdAt   DateTime     @default(now())
+  list        BroadcastList @relation(fields: [listId], references: [id], onDelete: Cascade)
+  contact     Contact      @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([listId, contactId])
+  @@index([listId])
+  @@index([contactId])
+}
+
+/// Vínculo entre contacto CRM y contacto ChatControl para trazabilidad
+model CrmContactLink {
+  id                  String          @id @default(cuid())
+  organizationId      String
+  crmLeadId           String          // ID del lead en el CRM
+  chatcontrolContactId String         // ID del contacto en ChatControl
+  phone               String
+  listId              String?         // Lista de broadcast asociada
+  assignedToUserId    String?         // Usuario de ChatControl que recibe el contacto
+  assignedToUser      User?           @relation("CrmContactLinksAssigned", fields: [assignedToUserId], references: [id])
+  externalData        Json?           // Datos adicionales del CRM (campaña, vendedor, etc.)
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @default(now()) @updatedAt
+  organization        Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  contact             Contact         @relation(fields: [chatcontrolContactId], references: [id], onDelete: Cascade)
+  broadcastList       BroadcastList?  @relation(fields: [listId], references: [id])
+
+  @@unique([organizationId, crmLeadId])
+  @@index([organizationId])
+  @@index([phone])
+  @@index([chatcontrolContactId])
+  @@index([listId])
+  @@index([assignedToUserId])
+}
+
+/// Auditoría de integración CRM
+model CrmAuditLog {
+  id             String   @id @default(cuid())
+  organizationId String
+  action         String   // "contacts_exported" | "list_created" | "connection_verified"
+  crmUser        String?
+  crmName        String?
+  contactsTotal  Int?
+  contactsCreated Int?
+  contactsUpdated Int?
+  contactsRejected Int?
+  listName       String?
+  details        Json?
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId])
+  @@index([createdAt(sort: Desc)])
+}
+
+model User {
+  id                String             @id @default(cuid())
+  email             String             @unique
+  passwordHash      String
+  displayName       String?
+  role              UserRole
+  isActive          Boolean          @default(true)
+  organizationId    String?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @default(now()) @updatedAt
+  messagesSent          Message[]          @relation("MessageSentBy")
+  platformAuditLogs     PlatformAuditLog[]
+  organization          Organization?      @relation(fields: [organizationId], references: [id])
+  assignedConversations Conversation[]     @relation("ConversationAssigned")
+  crmBroadcastLists     BroadcastList[]    @relation("BroadcastListsAssigned")
+  crmContactLinksAssigned CrmContactLink[] @relation("CrmContactLinksAssigned")
+
+  @@index([organizationId])
+  @@index([email])
+}
+
+/// Acciones del super admin sobre la plataforma (crear/suspender empresa, etc.).
+model PlatformAuditLog {
+  id                   String   @id @default(cuid())
+  actorUserId          String
+  action               String
+  targetOrganizationId String?
+  metadata             Json?
+  createdAt            DateTime @default(now())
+  actor                User     @relation(fields: [actorUserId], references: [id])
+
+  @@index([actorUserId])
+  @@index([targetOrganizationId])
+  @@index([createdAt(sort: Desc)])
+}
+
+model Contact {
+  id                  String         @id @default(cuid())
+  phone               String
+  email               String?
+  tagId               String?
+  interestStatus      String?
+  interestRespondedAt DateTime?
+  createdAt           DateTime       @default(now())
+  isSandboxAuthorized Boolean        @default(false)
+  name                String?
+  organizationId      String
+  campaignId          String?
+  organization        Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  campaign            Campaign?      @relation(fields: [campaignId], references: [id])
+  tag                 Tag?           @relation(fields: [tagId], references: [id])
+  conversations       Conversation[]
+  broadcastListLinks  BroadcastListContact[]
+  crmContactLinks     CrmContactLink[]
+  campaignContacts    CampaignContact[]
+
+  @@unique([organizationId, phone])
+  @@index([phone])
+  @@index([campaignId])
+  @@index([tagId])
+  @@index([organizationId, interestStatus])
+}
+
+model Conversation {
+  id                String    @id @default(cuid())
+  contactId         String
+  lastUserMessageAt DateTime?
+  createdAt         DateTime  @default(now())
+  lastReadAt        DateTime?
+  isNewLead         Boolean   @default(false)
+  isAiActive        Boolean   @default(false)
+  assignedToUserId  String?
+  assignedAt        DateTime?
+  autoMessageDetectedAt DateTime?
+  campaignId        String?
+  adReferral        Json?
+  contact           Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  campaign          Campaign? @relation(fields: [campaignId], references: [id])
+  messages          Message[]
+  assignedToUser    User?     @relation("ConversationAssigned", fields: [assignedToUserId], references: [id])
+  assignmentLog     ConversationAssignmentLog[]
+
+  @@index([contactId])
+  @@index([contactId, createdAt(sort: Desc)])
+  @@index([assignedToUserId])
+  @@index([isNewLead])
+  @@index([campaignId])
+}
+
+model ConversationAssignmentLog {
+  id              String       @id @default(cuid())
+  conversationId  String
+  fromUserId      String?
+  toUserId        String?
+  reassignedByUserId String
+  reason          String       // "manual" | "user_deleted"
+  createdAt       DateTime     @default(now())
+
+  conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@index([fromUserId])
+  @@index([createdAt(sort: Desc)])
+}
+
+model Message {
+  id                String           @id @default(cuid())
+  conversationId    String
+  direction         MessageDirection
+  type              MessageType      @default(TEXT)
+  status            MessageStatus    @default(SENT)
+  body              String
+  metaTemplateName  String?
+  whatsappMessageId String           @unique
+  whatsappTimestamp DateTime
+  fromAi            Boolean?         @default(false)
+  createdAt         DateTime         @default(now())
+  fileName          String?
+  mediaUrl          String?
+  mimeType          String?
+  sentByUserId      String?
+  isEdited          Boolean          @default(false)
+  editedAt          DateTime?
+  replyToId         String?
+  replyToWamid      String?
+  referral          Json?
+  errorCategory     String?
+  errorDetail       String?
+  conversation      Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sentByUser        User?            @relation("MessageSentBy", fields: [sentByUserId], references: [id])
+  editHistory       MessageEditHistory[]
+  replyTo           Message?         @relation("MessageReplyTo", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies           Message[]        @relation("MessageReplyTo")
+
+  @@index([conversationId])
+  @@index([conversationId, whatsappTimestamp])
+  @@index([whatsappMessageId])
+  @@index([sentByUserId])
+  @@index([replyToId])
+}
+
+model MessageEditHistory {
+  id              String   @id @default(cuid())
+  messageId       String
+  previousBody    String
+  editedAt        DateTime @default(now())
+  message         Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  @@index([editedAt(sort: Desc)])
+}
+
+model BroadcastLog {
+  id              String   @id @default(cuid())
+  conversationId  String
+  type            String
+  status          String
+  errorMessage    String?
+  createdAt       DateTime @default(now())
+  organizationId  String?
+  userId          String?
+  runId           String?
+  messageId       String?  @unique
+  failureCategory String?
+  title           String?
+
+  @@index([conversationId])
+  @@index([organizationId])
+  @@index([createdAt(sort: Desc)])
+  @@index([runId])
+}
+
+/// Configuración global legacy (tier, modelo por defecto). Preferir OrganizationSetting por tenant.
+model AppSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  updatedAt DateTime @updatedAt
+
+  @@index([key])
+}
+
+model Template {
+  id             String       @id @default(cuid())
+  name           String
+  body           String
+  variables      String[]
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([name])
+}
+
+enum OrganizationStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  ORG_ADMIN
+  AGENT
+}
+
+enum MessageDirection {
+  IN
+  OUT
+}
+
+enum MessageType {
+  TEXT
+  TEMPLATE
+  IMAGE
+  VIDEO
+  AUDIO
+  DOCUMENT
+}
+
+enum MessageStatus {
+  RECEIVED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+model Campaign {
+  id             String             @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  isActive       Boolean            @default(true)
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @default(now()) @updatedAt
+  organization   Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  campaignContacts CampaignContact[]
+  contacts         Contact[]
+  conversations    Conversation[]
+
+  @@index([organizationId])
+  @@index([isActive])
+}
+
+model CampaignContact {
+  id          String   @id @default(cuid())
+  campaignId  String
+  contactId   String
+  createdAt   DateTime @default(now())
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  contact  Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, contactId])
+  @@index([campaignId])
+  @@index([contactId])
+}
+
+model Tag {
+  id             String       @id @default(cuid())
+  organizationId String
+  name           String
+  createdAt      DateTime     @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  contacts       Contact[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
