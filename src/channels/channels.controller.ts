@@ -82,6 +82,25 @@ export class ChannelsController {
     return { ok: true, account };
   }
 
+  @Post('channels/test-connection')
+  @UseGuards(JwtAuthGuard, OrgMemberGuard, RolesGuard)
+  @Roles(UserRole.ORG_ADMIN, UserRole.AGENT)
+  async testConnection(
+    @CurrentUser() user: AuthUser,
+    @Body()
+    dto: {
+      channel: SupportedChannel;
+      accessToken?: string;
+      externalAccountId?: string;
+      businessAccountId?: string;
+    },
+  ) {
+    if (!user.organizationId) throw new BadRequestException('Usuario sin organización');
+    if (!dto.channel) throw new BadRequestException('Falta especificar el canal a probar');
+    const result = await this.channels.testChannelConnection(user.organizationId, dto.channel, dto);
+    return result;
+  }
+
   /**
    * Verificación pública de Webhooks para Meta (Instagram / Facebook Messenger) y TikTok
    */
