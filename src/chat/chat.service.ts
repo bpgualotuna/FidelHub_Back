@@ -219,7 +219,7 @@ export class ChatService implements OnModuleInit, OnModuleDestroy {
           channel: channel as ChannelType,
           lastUserMessageAt: new Date(payload.timestamp),
           campaignId: activeCampaignId,
-          isAiActive: true, // Activar Fidel automáticamente para nuevos leads omnicanal
+          isAiActive: false, // Desactivado por defecto para dar control al asesor humano antes de prender Fidel IA
           adReferral: payload.referral ? (payload.referral as any) : undefined,
         },
       });
