@@ -63,7 +63,8 @@ export class ConversationsQueryService {
     const list = await this.prisma.conversation.findMany({
       where,
       include: {
-        contact: { include: { tag: true } },
+        contact: { include: { tag: true, campaign: true } },
+        campaign: true,
         messages: {
           orderBy: { whatsappTimestamp: 'desc' },
           take: 1,
@@ -94,6 +95,8 @@ export class ConversationsQueryService {
         assignedToUserId: c.assignedToUserId,
         isNewLead: c.isNewLead,
         isAiActive: (c as any).isAiActive ?? false,
+        campaignId: c.campaignId ?? c.contact.campaignId ?? undefined,
+        campaignName: (c as any).campaign?.name ?? (c.contact as any).campaign?.name ?? undefined,
         adReferral: (c as any).adReferral ?? undefined,
       };
     });
@@ -109,7 +112,8 @@ export class ConversationsQueryService {
     const c = await this.prisma.conversation.findFirst({
       where: { id: conversationId, contact: { organizationId } },
       include: {
-        contact: { include: { tag: true } },
+        contact: { include: { tag: true, campaign: true } },
+        campaign: true,
         messages: {
           orderBy: { whatsappTimestamp: 'desc' },
           take: 1,
@@ -143,6 +147,8 @@ export class ConversationsQueryService {
       assignedToUserId: c.assignedToUserId,
       isNewLead: c.isNewLead,
       isAiActive: (c as any).isAiActive ?? false,
+      campaignId: c.campaignId ?? c.contact.campaignId ?? undefined,
+      campaignName: (c as any).campaign?.name ?? (c.contact as any).campaign?.name ?? undefined,
       adReferral: (c as any).adReferral ?? undefined,
     };
   }

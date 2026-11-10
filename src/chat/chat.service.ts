@@ -87,6 +87,8 @@ export interface Conversation {
   assignedToUserId?: string | null;
   isNewLead?: boolean;
   isAiActive?: boolean;
+  campaignId?: string | null;
+  campaignName?: string | null;
   adReferral?: any;
 }
 
