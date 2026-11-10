@@ -70,6 +70,20 @@ export class WhatsAppController {
   async webhook(@Body() body: Record<string, unknown>, @Res() res: Response) {
     res.status(200).send('OK');
 
+    // Reenvío en modo espejo transparente hacia Nextline para que siga funcionando intacto
+    const forwardUrl =
+      process.env.FORWARD_WEBHOOK_URL ||
+      'https://hackaton-nextline.onrender.com/api/whatsapp/webhook';
+    if (forwardUrl) {
+      fetch(forwardUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }).catch((err) => {
+        this.logger.warn(`[Webhook Relay Nextline] Error al replicar webhook: ${err?.message}`);
+      });
+    }
+
     try {
       const fs = require('fs');
       fs.appendFileSync('webhook-debug.log', JSON.stringify({ timestamp: new Date().toISOString(), body }, null, 2) + '\n---\n');
